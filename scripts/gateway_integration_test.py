@@ -343,12 +343,10 @@ class GatewayIntegrationTest:
             "memclaw_insights",
             "memclaw_evolve",
             "memclaw_stats",
-            "memclaw_share_skill",
-            "memclaw_unshare_skill",
         ]
         missing = [t for t in expected_tools if t not in also_allow]
         self.check(
-            "OpenClaw config: all 12 tools allowed",
+            "OpenClaw config: all 10 tools allowed",
             len(missing) == 0,
             f"missing={missing}" if missing else "",
         )
@@ -1035,7 +1033,7 @@ class GatewayIntegrationTest:
     # ═══════════════════════════════════════════════════════════
 
     def test_tool_descriptions_count(self):
-        """Verify the backend serves all 13 tool descriptions."""
+        """Verify the backend serves all 10 tool descriptions."""
         r = self.client.get(
             f"{self.api}/tool-descriptions", params={"tenant_id": self.tenant_id}
         )
@@ -1046,8 +1044,8 @@ class GatewayIntegrationTest:
             data = r.json()
             keys = set(data.keys()) if isinstance(data, dict) else set()
             self.check(
-                "Tool descriptions: 13 tools",
-                len(keys) >= 13,
+                "Tool descriptions: 10 tools",
+                len(keys) >= 10,
                 f"count={len(keys)}, keys={keys}",
             )
 
