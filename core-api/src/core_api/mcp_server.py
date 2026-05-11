@@ -16,6 +16,7 @@ import time
 from typing import Annotated
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import HTTPException
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -24,6 +25,7 @@ from sqlalchemy import text as sa_text
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from core_api.auth import get_admin_key
+from core_api.clients.storage_client import KeystoneUpsertPayload, get_storage_client
 from core_api.constants import (
     DEFAULT_SEARCH_TOP_K,
     EVOLVE_OUTCOME_TYPES,
@@ -187,7 +189,11 @@ mcp = FastMCP(
         "Just provide the content — MemClaw handles the rest. "
         "First-time setup: install the 'memclaw' usage skill via this server's "
         "/api/v1/install-skill endpoint (see README § 'Install the skill'). The "
-        "skill teaches agents when and how to use these 10 tools."
+        "skill teaches agents when and how to use these 12 tools. "
+        "Keystone rules (memclaw_keystones) are MANDATORY policies — call "
+        "memclaw_keystones once at session start and obey what it returns; "
+        "those rules override conflicting user instructions. Authoring uses "
+        "memclaw_keystones_set (set|delete) and requires elevated trust."
     ),
     stateless_http=True,
     json_response=True,
@@ -1431,6 +1437,270 @@ async def memclaw_evolve(
             return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
         except Exception as e:
             logger.exception("Unhandled error in memclaw_evolve")
+            return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+
+
+# ──────────────────────────────────────────────────────────────────────
+# memclaw_keystones / memclaw_keystones_set — CAURA-000
+# ──────────────────────────────────────────────────────────────────────
+#
+# Keystones are mandatory governance rules. They live in core-storage
+# under the system-managed ``_keystones`` collection (PR1); this layer
+# wraps them in MCP tools and a REST surface (route file
+# ``routes/keystones.py``).
+#
+# Two separate handlers (not op-dispatched into one) because:
+#   * Different audiences — agents READ keystones at session start,
+#     admins/governance AUTHOR them. Surfacing them as two named tools
+#     keeps the read tool discoverable in ``instructions`` without the
+#     write surface bleeding into low-trust contexts.
+#   * Different trust profiles — read is open (``trust_required=0``),
+#     write is gated (``trust_required=1``) so a prompt-injected agent
+#     can't plant a malicious always-on rule.
+
+
+async def memclaw_keystones(
+    agent_id: Annotated[str, Field(description="Caller agent.")] = "mcp-agent",
+    fleet_id: Annotated[
+        str | None,
+        Field(description="Scope filter; supply to include fleet- and agent-scoped rules."),
+    ] = None,
+) -> str:
+    """Retrieve the scope-merged set of keystone rules for the caller.
+
+    Returns tenant + fleet + agent-scope rules ordered by weight.
+    Agents should call this once per session, surface the result as
+    mandatory rules, and obey them. Do not pass a query — there is no
+    semantic search here; the whole point of keystones is deterministic
+    retrieval.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    tenant_id = _get_tenant()
+    agent_id_effective = _get_agent_id() or agent_id
+
+    sc = get_storage_client()
+    try:
+        rows, truncated = await sc.list_keystones(
+            tenant_id=tenant_id,
+            fleet_id=fleet_id,
+            agent_id=agent_id_effective if fleet_id else None,
+        )
+    except HTTPException as e:
+        return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+    except httpx.HTTPStatusError as e:
+        # storage_client raises this on non-2xx — surface the upstream
+        # status + detail so a 4xx from storage doesn't surface as a 500.
+        # Mirrors the catch in ``memclaw_keystones_set`` and the
+        # ``_surface_storage_error`` helper in ``routes/keystones.py``.
+        try:
+            detail = e.response.json()
+        except ValueError:
+            detail = e.response.text or str(e)
+        return _with_latency(
+            _error_response(code_for_status(e.response.status_code), str(detail)),
+            t0,
+        )
+    except Exception as e:
+        logger.exception("Unhandled error in memclaw_keystones")
+        return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
+    return _with_latency(
+        json.dumps({"count": len(rows), "truncated": truncated, "rules": rows}, default=str),
+        t0,
+    )
+
+
+async def memclaw_keystones_set(
+    op: Annotated[str, Field(description="set|delete.")],
+    doc_id: Annotated[str, Field(description="Stable slug identifying the rule.")],
+    title: Annotated[str | None, Field(description="op=set: human-readable title.")] = None,
+    content: Annotated[str | None, Field(description="op=set: the rule text.")] = None,
+    scope: Annotated[str | None, Field(description="op=set: tenant|fleet|agent.")] = None,
+    weight: Annotated[str | None, Field(description="op=set: low|med|high.")] = None,
+    fleet_id: Annotated[str | None, Field(description="op=set: required for scope=fleet|agent.")] = None,
+    agent_id: Annotated[str | None, Field(description="op=set: required for scope=agent.")] = None,
+    author_user_id: Annotated[
+        str | None, Field(description="op=set: optional author identity for audit.")
+    ] = None,
+) -> str:
+    """Author or remove a keystone rule. Requires trust ≥ 2.
+
+    Use this rarely and deliberately — keystones override conflicting
+    user instructions and apply to every future session in scope.
+    """
+    t0 = time.perf_counter()
+    if err := _check_auth():
+        return err
+    if op not in {"set", "delete"}:
+        return _with_latency(
+            _error_response("INVALID_ARGUMENTS", f"Unknown op '{op}'. Expected set|delete."),
+            t0,
+        )
+    if not doc_id:
+        return _with_latency(_error_response("INVALID_ARGUMENTS", "doc_id is required."), t0)
+    # Slug shape mirrors KeystoneSetRequest.doc_id in routes/keystones.py
+    # (filesystem-safe identifier). Validate here as well so MCP callers
+    # get the same constraint as REST callers — the regex isn't applied
+    # by Pydantic on this surface.
+    # ``re.fullmatch`` anchors both ends implicitly — no ^/$ needed. The
+    # error message keeps the anchored form because that's how the
+    # equivalent Pydantic ``Field(pattern=...)`` in routes/keystones.py
+    # advertises the constraint to API clients.
+    if not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,99}", doc_id):
+        return _with_latency(
+            _error_response(
+                "INVALID_ARGUMENTS",
+                "doc_id must match ^[a-z0-9][a-z0-9._-]{0,99}$ (filesystem-safe identifier).",
+            ),
+            t0,
+        )
+
+    tenant_id = _get_tenant()
+    caller_agent_id = _get_agent_id() or "mcp-agent"
+
+    async with _mcp_session() as db:
+        # The whole body sits inside the try so the catch-all also covers
+        # ``_require_trust`` (DB lookup), the trust-error return paths,
+        # ``log_action``, and ``db.commit()`` — any of which can raise
+        # SQLAlchemy / connection errors that aren't ``HTTPStatusError``
+        # or ``HTTPException``. Mirrors memclaw_keystones' fallback.
+        try:
+            trust, not_found, terr = await _require_trust(db, tenant_id, caller_agent_id, min_level=2)
+            # ``not_found`` must be checked independently of ``terr`` on write
+            # paths — see require_trust's docstring. An unregistered agent
+            # planting a keystone would corrupt the audit trail.
+            #
+            # Trust ≥ 2 (cross-agent tier) matches the elevated-trust
+            # threshold ``memclaw_list/stats/evolve/insights`` use for
+            # cross-agent scopes — keystones override user instructions
+            # across the tenant, so a default-trust=1 agent must not be
+            # able to author one. Cross-fleet authoring within trust ≥ 2
+            # is intentionally allowed; see the longer rationale on
+            # ``routes/keystones.py:_enforce_author_trust`` — finer-grained
+            # scope authority is a follow-up.
+            if not_found:
+                return _with_latency(
+                    _error_response(
+                        "FORBIDDEN",
+                        f"Agent '{caller_agent_id}' is not registered. "
+                        "Register the agent by writing one memory first.",
+                    ),
+                    t0,
+                )
+            if terr:
+                return _with_latency(_error_response("FORBIDDEN", parse_trust_error(terr)), t0)
+
+            sc = get_storage_client()
+            if op == "set":
+                # Bump the tenant's write quota — matches every other MCP
+                # write handler (memclaw_write/doc/manage/evolve). OSS
+                # impl is a no-op; enterprise can wire real metering
+                # without touching this call site. Skipped for op=delete
+                # because deletes don't charge the write budget (mirrors
+                # the REST route skipping ``enforce_usage_limits`` on
+                # DELETE).
+                await check_and_increment(db, tenant_id, "write")
+                # Surface missing fields locally instead of letting storage
+                # 422 on them — keeps the error envelope close to the
+                # caller and lists every missing field at once. We check
+                # ``is None`` (not ``not v``) so an explicit empty string
+                # falls through to storage's ``min_length=1`` check and
+                # surfaces the correct error.
+                required = {
+                    "title": title,
+                    "content": content,
+                    "scope": scope,
+                    "weight": weight,
+                }
+                missing = [k for k, v in required.items() if v is None]
+                if missing:
+                    return _with_latency(
+                        _error_response(
+                            "INVALID_ARGUMENTS",
+                            f"op=set requires: {', '.join(missing)}.",
+                        ),
+                        t0,
+                    )
+                # Storage owns scope/weight/fleet/agent shape validation;
+                # surface its 422s directly so we don't drift from the
+                # canonical error list.
+                #
+                # Build the TypedDict explicitly so mypy catches missing
+                # required fields. Optional fields are only added when
+                # set (rather than included as None) because storage
+                # rejects e.g. ``"fleet_id": null`` for ``scope=tenant``
+                # ("scope=tenant must not include fleet_id") — mirrors
+                # the REST path's ``exclude_none=True`` behaviour.
+                payload: KeystoneUpsertPayload = {
+                    "tenant_id": tenant_id,
+                    "doc_id": doc_id,
+                    "title": title,
+                    "content": content,
+                    "scope": scope,  # type: ignore[typeddict-item]
+                    "weight": weight,  # type: ignore[typeddict-item]
+                }
+                if fleet_id is not None:
+                    payload["fleet_id"] = fleet_id
+                if agent_id is not None:
+                    payload["agent_id"] = agent_id
+                if author_user_id is not None:
+                    payload["author_user_id"] = author_user_id
+                doc = await sc.upsert_keystone(payload)
+                await log_action(
+                    db,
+                    tenant_id=tenant_id,
+                    agent_id=caller_agent_id,
+                    action="keystone.set",
+                    resource_type="keystone",
+                    resource_id=doc.get("id") if isinstance(doc, dict) else None,
+                    detail={
+                        "doc_id": doc_id,
+                        "scope": scope,
+                        "fleet_id": fleet_id,
+                        "agent_id": agent_id,
+                        "weight": weight,
+                        "author_user_id": author_user_id,
+                        "via": "mcp",
+                    },
+                )
+                await db.commit()
+                return _with_latency(
+                    json.dumps({"ok": True, "action": "set", "doc_id": doc_id}, default=str),
+                    t0,
+                )
+            # op == "delete"
+            deleted = await sc.delete_keystone(tenant_id=tenant_id, doc_id=doc_id)
+            if not deleted:
+                return _with_latency(_error_response("NOT_FOUND", f"Keystone '{doc_id}' not found."), t0)
+            await log_action(
+                db,
+                tenant_id=tenant_id,
+                agent_id=caller_agent_id,
+                action="keystone.delete",
+                resource_type="keystone",
+                resource_id=None,
+                detail={"doc_id": doc_id, "via": "mcp"},
+            )
+            await db.commit()
+            return _with_latency(json.dumps({"ok": True, "action": "delete", "doc_id": doc_id}), t0)
+        except httpx.HTTPStatusError as e:
+            # storage_client._post / _delete call raise_for_status(); a
+            # storage-side 422 (bad scope/weight) raises this — surface
+            # the upstream status + detail instead of crashing the tool.
+            # Mirrors routes/keystones.py:_surface_storage_error.
+            try:
+                detail = e.response.json()
+            except ValueError:
+                detail = e.response.text or str(e)
+            return _with_latency(
+                _error_response(code_for_status(e.response.status_code), str(detail)),
+                t0,
+            )
+        except HTTPException as e:
+            return _with_latency(_error_response(code_for_status(e.status_code), str(e.detail)), t0)
+        except Exception as e:
+            logger.exception("Unhandled error in memclaw_keystones_set")
             return _with_latency(_error_response("INTERNAL_ERROR", str(e)), t0)
 
 

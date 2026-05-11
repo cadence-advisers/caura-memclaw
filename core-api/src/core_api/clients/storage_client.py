@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+from typing import Any, Literal, NotRequired, TypedDict
 
 import httpx
 
@@ -13,6 +13,28 @@ from core_api.clients.identity_token import fetch_auth_header
 from core_api.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class KeystoneUpsertPayload(TypedDict):
+    """Shape of the body POSTed to ``/keystones`` on core-storage.
+
+    Required fields match the storage-side validator's required set
+    (storage 422s on any missing one). Optional fields use
+    ``NotRequired`` so callers can omit them — both surfaces strip
+    ``None`` before posting because storage distinguishes a present
+    ``"fleet_id": null`` from an absent key.
+    """
+
+    tenant_id: str
+    doc_id: str
+    title: str
+    content: str
+    scope: Literal["tenant", "fleet", "agent"]
+    weight: Literal["low", "med", "high"]
+    fleet_id: NotRequired[str]
+    agent_id: NotRequired[str]
+    author_user_id: NotRequired[str]
+
 
 _client: CoreStorageClient | None = None
 
@@ -736,6 +758,43 @@ class CoreStorageClient:
             f"/documents/{collection}/{doc_id}",
             tenant_id=tenant_id,
         )
+
+    # =====================================================================
+    # Keystones (CAURA-000)
+    # =====================================================================
+    #
+    # Thin proxies over the core-storage ``/keystones`` endpoints. The
+    # GET path returns a ``(rows, truncated)`` tuple so the upstream
+    # caller can surface the ``X-Truncated`` header to MCP/REST clients
+    # — silent truncation hides governance gaps.
+
+    async def list_keystones(
+        self,
+        tenant_id: str,
+        fleet_id: str | None = None,
+        agent_id: str | None = None,
+    ) -> tuple[list[dict], bool]:
+        params: dict[str, Any] = {"tenant_id": tenant_id}
+        if fleet_id is not None:
+            params["fleet_id"] = fleet_id
+        if agent_id is not None:
+            params["agent_id"] = agent_id
+        headers = await self._auth_headers(read=True)
+        resp = await self._read_http.get(
+            f"{self._read_prefix}/keystones",
+            params=params,
+            headers=headers,
+        )
+        self._maybe_evict_on_auth_error(resp, read=True)
+        resp.raise_for_status()
+        truncated = resp.headers.get("X-Truncated", "").lower() == "true"
+        return resp.json(), truncated
+
+    async def upsert_keystone(self, data: KeystoneUpsertPayload) -> dict:
+        return await self._post("/keystones", data)  # type: ignore[return-value]
+
+    async def delete_keystone(self, tenant_id: str, doc_id: str) -> bool:
+        return await self._delete(f"/keystones/{doc_id}", tenant_id=tenant_id)
 
     # =====================================================================
     # Fleet
