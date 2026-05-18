@@ -341,50 +341,132 @@ Follow these steps in order:
      - two different people who share a first name or last name
      - two different companies, products, projects, or teams
      - any case where you are not confident the subjects are the same entity
-4. Decide contradicts:
+4. Decide non_conflict_reason. Even when same_subject is true, certain
+   shapes describe two claims that BOTH hold and so are NOT a
+   contradiction. Pick at most one value; pick "none" when the two
+   statements really do assert mutually exclusive states.
+     - "temporal_supersession": the statements describe sequential
+       states of the same subject's lifecycle (planned -> shipped,
+       open -> closed, draft -> published, beta -> GA, hired ->
+       promoted). The newer state simply supersedes the older one;
+       both were true in sequence.
+     - "list_valued_predicate": the two statements describe attributes
+       of the same subject that do not compete for a single slot.
+       Two shapes both qualify:
+       (a) one predicate that naturally holds multiple values at the
+       same time — "supports English" / "supports French"; speaks
+       multiple languages; "reports_to" in matrix orgs; "works_on"
+       parallel projects;
+       (b) two entirely different attributes of the same subject —
+       e.g., "Alice was promoted to Senior Engineer" (her title)
+       and "Alice is on the platform team" (her team) are
+       complementary facts; both hold simultaneously. Different
+       attributes do not exclude each other.
+     - "refinement": one statement is a more specific version of the
+       other ("Europe" vs "Munich"; "tech" vs "Google"; "Q3" vs
+       "September 15"). Both hold; finer granularity does not negate
+       coarser.
+     - "scope_mismatch": the statements describe the same subject with
+       different implicit qualifiers — whole vs part (parent company
+       vs division), different time windows (annual vs quarterly), or
+       different context qualifiers (weekday vs weekend, work vs
+       residence). Both can hold simultaneously.
+     - "same_name_distinct_subject": subject_a and subject_b share a
+       surface name but plausibly refer to different real-world
+       instances (two different builds of "the nightly build", two
+       different days of "today's standup", two different people both
+       called "John" without disambiguator). This is the symmetric
+       complement to same_subject=false for cases where the names
+       happen to match.
+     - "conditional_unrealized": one statement is conditional /
+       hypothetical / irrealis ("if X then Y", "would", "could",
+       "might"), and the other is a realised state. The conditional
+       does not assert a claim that can contradict.
+     - "event_restatement": the two statements describe the SAME
+       event with different tense, aspect, or synonymous verbs
+       ("acquired" / "is acquiring" the same deal; "was hired" /
+       "joined"). They restate the same fact, not different facts.
+     - "none": none of the above applies. Use this when the two
+       statements really do make incompatible claims about the same
+       subject at the same time frame (e.g., "X lives in Tel Aviv"
+       vs "X lives in Haifa" as undated current-state claims).
+   Two state claims about the same subject are also NOT a
+   contradiction when BOTH statements explicitly reference
+   non-overlapping past time periods (e.g., "X lived in Tel Aviv
+   from 2010 to 2014" vs "X lived in Haifa from 2015 to 2018").
+   In that case set non_conflict_reason="scope_mismatch".
+5. Decide contradicts:
    - If same_subject is false, contradicts MUST be false.
-   - If same_subject is true, contradicts is true ONLY when the two
-     statements assert mutually exclusive states about that subject
-     referring to the same time frame.
-   - Updates / corrections about the same subject ARE contradictions
-     (e.g., "X lives in Tel Aviv" vs "X lives in Haifa").
-   - More specific versions of the same fact are NOT contradictions.
-   - Complementary information is NOT a contradiction.
-   - Two state claims about the same subject are NOT a contradiction ONLY
-     when BOTH statements explicitly reference non-overlapping past time
-     periods (e.g., "X lived in Tel Aviv from 2010 to 2014" vs "X lived in
-     Haifa from 2015 to 2018" — both can be historically true). In every
-     other case, including when only one statement carries a date stamp,
-     conflicting same-subject state claims ARE contradictions; do not
-     speculate that one might describe a future state that resolves the
-     conflict.
+   - If non_conflict_reason is not "none", contradicts MUST be false.
+   - Otherwise contradicts is true only when the two statements assert
+     mutually exclusive states about that subject in the same time
+     frame. Updates / corrections about the same subject ARE
+     contradictions (e.g., "X lives in Tel Aviv" vs "X lives in
+     Haifa"). Do not speculate that one statement might describe a
+     future state that resolves the conflict — if it does, choose
+     temporal_supersession explicitly.
 
 Reply with ONLY a JSON object, no prose, no markdown fences:
 {{"subject_a": "<short noun phrase>",
   "subject_b": "<short noun phrase>",
   "same_subject": true/false,
+  "non_conflict_reason": "none|temporal_supersession|list_valued_predicate|refinement|scope_mismatch|same_name_distinct_subject|conditional_unrealized|event_restatement",
   "contradicts": true/false,
   "reason": "one short phrase referencing the subjects and the conflict (or its absence)"}}
 """
 
 
-def _parse_contradiction_response(raw: dict) -> bool:
-    """Apply the structured-output safety gate.
+# CAURA-124 — within-subject false-positive shapes that hard-gate
+# ``contradicts=true`` to ``false``. ``none`` (or absent / unknown
+# value) is the only enum value that allows a contradiction to stand.
+# Keep this set in sync with the enum listed in ``CONTRADICTION_PROMPT``
+# and with the wet-test fixtures in
+# ``scripts/wet_test_contradiction_prompt.py``.
+NON_CONFLICT_REASONS: frozenset[str] = frozenset(
+    {
+        "temporal_supersession",
+        "list_valued_predicate",
+        "refinement",
+        "scope_mismatch",
+        "same_name_distinct_subject",
+        "conditional_unrealized",
+        "event_restatement",
+    }
+)
 
-    The prompt requires the model to commit to ``same_subject`` before
-    ``contradicts``. If ``same_subject`` is false (or missing), ``contradicts``
-    MUST be false regardless of what the model emitted — this guards against
-    cross-subject false positives even when the model returns an inconsistent
-    combination. Missing keys are treated as false (conservative default).
+
+def _parse_contradiction_response(raw: dict) -> bool:
+    """Apply the structured-output safety gates.
+
+    Two gates run, in order:
+
+    1. **Cross-subject gate (CAURA-111).** The prompt requires the model
+       to commit to ``same_subject`` before ``contradicts``. If
+       ``same_subject`` is false (or missing), ``contradicts`` MUST be
+       false regardless of what the model emitted.
+
+    2. **Within-subject FP gate (CAURA-124).** Even when same_subject is
+       true, certain shapes describe two claims that both hold and
+       must not be flagged. The model classifies the shape into
+       ``non_conflict_reason``; any value in ``NON_CONFLICT_REASONS``
+       forces ``contradicts=false``. ``"none"`` (or absent / unknown
+       value) leaves ``contradicts`` untouched.
+
+    Missing keys and non-boolean values are treated conservatively
+    (False for booleans; None for non_conflict_reason, which has the
+    same effect as "none" — neither fires Gate 2). ``bool("false")``
+    is True in Python, so a model returning the *string* "false"
+    instead of the boolean would have silently bypassed the gate —
+    both gates use identity-against-True comparisons to avoid that
+    trap.
     """
     if not isinstance(raw, dict):
         return False
-    # Identity check against True — anything else (False, missing, the JSON
-    # string "false", numbers, None) is conservatively treated as False.
-    # ``bool("false")`` is True in Python, so a model returning the string
-    # "false" instead of the boolean would have silently bypassed the gate.
+
     same_subject = raw.get("same_subject") is True
     contradicts = raw.get("contradicts") is True
+
+    # Gate 1 — cross-subject (CAURA-111).
     if contradicts and not same_subject:
         logger.warning(
             "Contradiction model returned contradicts=true with same_subject=false; "
@@ -394,11 +476,35 @@ def _parse_contradiction_response(raw: dict) -> bool:
             raw.get("reason"),
         )
         return False
-    # The dangerous (contradicts=True, same_subject=False) case was handled
-    # above. Returning ``contradicts`` is therefore equivalent to
-    # ``same_subject and contradicts``: if contradicts is False the result
-    # is False either way; if contradicts is True we only reach this line
-    # when same_subject is True.
+
+    # Gate 2 — within-subject FP shapes (CAURA-124). Only fires when
+    # the model both flagged a contradiction AND named a recognised
+    # non-conflict shape — otherwise it's a no-op. Locals are named
+    # ``non_conflict_reason`` (not ``reason``) so they don't collide
+    # with the model's free-text ``raw["reason"]`` field that the
+    # logger calls pass through verbatim.
+    raw_ncr = raw.get("non_conflict_reason")
+    non_conflict_reason = raw_ncr if isinstance(raw_ncr, str) else None
+    if contradicts and non_conflict_reason in NON_CONFLICT_REASONS:
+        # WARNING (not INFO): this branch fires only when the model
+        # returned an internally inconsistent response — contradicts=true
+        # alongside a recognised non_conflict_reason, which the prompt
+        # explicitly forbids in step 5. Same severity as Gate 1's
+        # cross-subject override so model regressions surface at the
+        # standard WARNING level rather than getting buried in INFO.
+        logger.warning(
+            "Contradiction model returned contradicts=true with "
+            "non_conflict_reason=%r; overriding to false. "
+            "subject_a=%r subject_b=%r reason=%r",
+            non_conflict_reason,
+            raw.get("subject_a"),
+            raw.get("subject_b"),
+            raw.get("reason"),
+        )
+        return False
+
+    # Both gates passed (or contradicts is already False) — return the
+    # model's verdict.
     return contradicts
 
 
