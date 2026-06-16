@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 Subsequent releases are produced by [release-please](https://github.com/googleapis/release-please-action)
 from [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [2.17.0](https://github.com/caura-ai/caura-memclaw/compare/backend-v2.16.0...backend-v2.17.0) (2026-06-16)
+
+
+### Features
+
+* **audit:** tamper-evident per-tenant hash chain for audit_log (eToro governance) ([#397](https://github.com/caura-ai/caura-memclaw/issues/397)) ([baaa493](https://github.com/caura-ai/caura-memclaw/commit/baaa493cdc8a2bf71d031b0f457844d389c8f6c4))
+* **core-api:** fast business/personal pre-gate before enrichment (opt-in) ([#403](https://github.com/caura-ai/caura-memclaw/issues/403)) ([095c360](https://github.com/caura-ai/caura-memclaw/commit/095c36043ebeeb1c13e7cde79895bfda6aa324f6))
+* **governance:** ingestion-boundary PII + business/personal gate (eToro) ([#398](https://github.com/caura-ai/caura-memclaw/issues/398)) ([12860af](https://github.com/caura-ai/caura-memclaw/commit/12860af951539ea2b097f2f2dd9ee7615b1c9464))
+
+
+### Bug Fixes
+
+* **http-retry:** widen connection-phase retry to ride out storage cold starts ([#406](https://github.com/caura-ai/caura-memclaw/issues/406)) ([5bbede7](https://github.com/caura-ai/caura-memclaw/commit/5bbede7481032397ec50400f166f12f132b5fc4a))
+* **prompts:** stop brace-escaping content before str.format ([#404](https://github.com/caura-ai/caura-memclaw/issues/404)) ([ba94a54](https://github.com/caura-ai/caura-memclaw/commit/ba94a54b2ade8641fa58cbf447db2759cc550604))
+
 ## [2.16.0](https://github.com/caura-ai/caura-memclaw/compare/backend-v2.15.0...backend-v2.16.0) (2026-06-15)
 
 
