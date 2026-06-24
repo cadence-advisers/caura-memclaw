@@ -167,6 +167,54 @@ def _apply_engine_policy(table: str) -> None:
     )
 
 
+# Trigger functions whose body only calls pg_catalog builtins (to_tsvector);
+# pinning an empty search_path closes the "mutable search_path" advisor without
+# touching the body (pg_catalog is always implicitly resolvable).
+_SEARCH_PATH_FUNCS = (
+    "memories_search_vector_update()",
+    "entities_search_vector_update()",
+)
+
+
+def _harden_platform_advisors() -> None:
+    """Close the Supabase security-advisor WARNs, safely on any deployment.
+
+    Three fixes, all idempotent and guarded so a non-Supabase (vanilla Postgres,
+    no ``extensions`` schema) deployment is unaffected:
+
+    * pin ``search_path`` on the two tsvector trigger functions;
+    * add ``extensions`` to the app role's ``search_path`` (a non-existent
+      schema in the path is simply ignored, so this is harmless everywhere);
+    * relocate the ``vector`` extension out of ``public`` into ``extensions``
+      ONLY when that schema exists and vector is currently in ``public`` —
+      granting the app role ``USAGE`` on ``extensions`` first so its bare
+      ``<=>`` / ``::vector`` operators keep resolving.
+    """
+    for fn in _SEARCH_PATH_FUNCS:
+        op.execute(f"ALTER FUNCTION public.{fn} SET search_path = ''")
+
+    # Harmless when `extensions` doesn't exist (ignored entries in search_path).
+    op.execute(f'ALTER ROLE {APP_ROLE} SET search_path = "$user", public, extensions')
+
+    op.execute(
+        f"""
+        DO $$
+        BEGIN
+            IF EXISTS (SELECT 1 FROM information_schema.schemata WHERE schema_name = 'extensions')
+               AND EXISTS (
+                   SELECT 1 FROM pg_extension e
+                   JOIN pg_namespace n ON n.oid = e.extnamespace
+                   WHERE e.extname = 'vector' AND n.nspname = 'public'
+               ) THEN
+                GRANT USAGE ON SCHEMA extensions TO {APP_ROLE};
+                ALTER EXTENSION vector SET SCHEMA extensions;
+            END IF;
+        END
+        $$;
+        """
+    )
+
+
 def upgrade() -> None:
     _ensure_role()
     _grant_role()
@@ -176,6 +224,7 @@ def upgrade() -> None:
     for table in ENGINE_TABLES:
         _enable_force_rls(table)
         _apply_engine_policy(table)
+    _harden_platform_advisors()
 
 
 def downgrade() -> None:
