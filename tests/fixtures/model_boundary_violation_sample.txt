@@ -1,0 +1,24 @@
+# Planted-violation sample for tests/test_model_agnostic_config_boundary.py.
+#
+# NOT real source. The .txt extension keeps it out of pytest collection, ruff,
+# and the runtime tree the guard actually scans. The guard self-test parses
+# this content directly to prove it CATCHES introduced violations while
+# ignoring comments, docstrings, and prompt-template constants.
+#
+# This comment names gpt-4o and api.openai.com and must NOT be flagged
+# (comments are not in the AST at all).
+"""Module docstring naming claude-3-opus must NOT be flagged (docstrings are stripped)."""
+
+# Three genuine violations the guard MUST catch:
+EVIL_DEFAULT_MODEL = "gpt-4o-mini"            # model-identifier
+PROVIDER_BASE_URL = "https://api.openai.com/v1"  # llm-base-url
+
+
+def pick(provider):
+    if provider == "anthropic":               # provider-selection-literal
+        return provider
+    return "fallback"
+
+
+# Must NOT be flagged: a *_PROMPT constant legitimately names example models.
+EXAMPLE_PROMPT = "Extract model names like gpt-4o and gemini-2.0-flash from the content."
