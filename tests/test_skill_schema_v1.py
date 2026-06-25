@@ -664,7 +664,7 @@ class TestMigrationChain:
     def test_single_head(self):
         chain = self._load()
         heads = set(chain) - {dr for dr in chain.values() if dr is not None}
-        assert heads == {"026"}, f"Expected single head '026', got {sorted(heads)}"
+        assert heads == {"027"}, f"Expected single head '027', got {sorted(heads)}"
 
     def test_skill_factory_chain_links(self):
         chain = self._load()
@@ -678,6 +678,8 @@ class TestMigrationChain:
         assert chain.get("025") == "024", "025 must follow 024"
         # 026: RLS enable/force + tenant policies
         assert chain.get("026") == "025", "026 must follow 025"
+        # 027: codify brain ops layer (graph + isolation/health monitors)
+        assert chain.get("027") == "026", "027 must follow 026"
 
 
 @pytest.mark.unit
