@@ -117,9 +117,7 @@ def _ensure_role() -> None:
 
 def _grant_role() -> None:
     op.execute(f"GRANT USAGE ON SCHEMA public TO {APP_ROLE}")
-    op.execute(
-        f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {APP_ROLE}"
-    )
+    op.execute(f"GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO {APP_ROLE}")
     op.execute(f"GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO {APP_ROLE}")
     # Future tables/sequences created by postgres auto-grant to the app role,
     # so a new table can never silently regress to "no app access".
@@ -127,10 +125,7 @@ def _grant_role() -> None:
         f"ALTER DEFAULT PRIVILEGES IN SCHEMA public "
         f"GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO {APP_ROLE}"
     )
-    op.execute(
-        f"ALTER DEFAULT PRIVILEGES IN SCHEMA public "
-        f"GRANT USAGE, SELECT ON SEQUENCES TO {APP_ROLE}"
-    )
+    op.execute(f"ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO {APP_ROLE}")
 
 
 def _enable_force_rls(table: str) -> None:
@@ -141,29 +136,21 @@ def _enable_force_rls(table: str) -> None:
 def _apply_tenant_policies(table: str) -> None:
     for name in ("tenant_select", "tenant_insert", "tenant_modify", "tenant_delete"):
         op.execute(f"DROP POLICY IF EXISTS {name} ON public.{table}")
+    op.execute(f"CREATE POLICY tenant_select ON public.{table} FOR SELECT TO public USING ({_SELECT_USING})")
     op.execute(
-        f"CREATE POLICY tenant_select ON public.{table} "
-        f"FOR SELECT TO public USING ({_SELECT_USING})"
-    )
-    op.execute(
-        f"CREATE POLICY tenant_insert ON public.{table} "
-        f"FOR INSERT TO public WITH CHECK ({_WRITE_PRED})"
+        f"CREATE POLICY tenant_insert ON public.{table} FOR INSERT TO public WITH CHECK ({_WRITE_PRED})"
     )
     op.execute(
         f"CREATE POLICY tenant_modify ON public.{table} "
         f"FOR UPDATE TO public USING ({_WRITE_PRED}) WITH CHECK ({_WRITE_PRED})"
     )
-    op.execute(
-        f"CREATE POLICY tenant_delete ON public.{table} "
-        f"FOR DELETE TO public USING ({_WRITE_PRED})"
-    )
+    op.execute(f"CREATE POLICY tenant_delete ON public.{table} FOR DELETE TO public USING ({_WRITE_PRED})")
 
 
 def _apply_engine_policy(table: str) -> None:
     op.execute(f"DROP POLICY IF EXISTS engine_all ON public.{table}")
     op.execute(
-        f"CREATE POLICY engine_all ON public.{table} "
-        f"FOR ALL TO {APP_ROLE} USING (true) WITH CHECK (true)"
+        f"CREATE POLICY engine_all ON public.{table} FOR ALL TO {APP_ROLE} USING (true) WITH CHECK (true)"
     )
 
 

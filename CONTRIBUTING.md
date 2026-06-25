@@ -66,6 +66,20 @@ pytest tests/ -v
 
 See `README.md` for more deployment options and environment variable details.
 
+### CI checks
+
+Two GitHub Actions workflows gate every PR:
+
+- **`config-boundary-guard`** (required) — runs the model-agnostic
+  config-boundary guard (`tests/test_model_agnostic_config_boundary.py`). It is
+  fast and needs no database, so it is the required status check that must be
+  green to merge. If you hardcode a model id, LLM base URL, or
+  provider-selection string outside the config boundary, this check fails — see
+  [`docs/adr/0001-model-agnostic-config-boundary.md`](docs/adr/0001-model-agnostic-config-boundary.md).
+  Run it locally with `pytest tests/test_model_agnostic_config_boundary.py --noconftest`.
+- **`ci.yml`** — the fuller suite (ruff, mypy, DB-backed integration tests,
+  migrations, package builds) against a `pgvector` service.
+
 ## Workflow
 
 1. **Open an issue first** for anything non-trivial — a bug fix under ~30 lines
