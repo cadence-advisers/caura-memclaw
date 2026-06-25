@@ -31,6 +31,7 @@ from common.llm.constants import (
     OPENAI_REQUEST_TIMEOUT_SECONDS,
 )
 from common.llm.providers._shape_error import ProviderResponseShapeError
+from common.provider_names import ProviderName
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,37 @@ class OpenAIResponseShapeError(ProviderResponseShapeError):
     def __reduce__(self) -> tuple:
         # See VertexResponseShapeError.__reduce__ for rationale.
         return (type(self), (self.args[1], self.args[2]))
+
+
+def _to_strict_schema(schema: dict) -> dict:
+    """Return a copy of a JSON Schema made *strict*-mode compliant.
+
+    Strict mode requires every object to set ``additionalProperties: false`` and
+    list all of its properties in ``required``. Pydantic's ``model_json_schema()``
+    does neither by default. Anthropic's OpenAI-compatible endpoint REQUIRES
+    ``json_schema.strict = true`` (it 400s otherwise) and enforces this schema
+    shape, so we transform the schema for that path. Recurses through
+    ``properties``, ``items``, ``$defs``/``definitions`` and
+    ``anyOf``/``allOf``/``oneOf``. Pure — does not mutate the input. Verified live
+    against api.anthropic.com on the ExtractedGraph schema (BP-7).
+    """
+    if not isinstance(schema, dict):
+        return schema
+    out = dict(schema)
+    if out.get("type") == "object" or "properties" in out:
+        out["additionalProperties"] = False
+        if "properties" in out:
+            out["properties"] = {k: _to_strict_schema(v) for k, v in out["properties"].items()}
+            out["required"] = list(out["properties"].keys())
+    if "items" in out:
+        out["items"] = _to_strict_schema(out["items"])
+    for _combiner in ("anyOf", "allOf", "oneOf"):
+        if _combiner in out:
+            out[_combiner] = [_to_strict_schema(s) for s in out[_combiner]]
+    for _defs in ("$defs", "definitions"):
+        if _defs in out:
+            out[_defs] = {k: _to_strict_schema(v) for k, v in out[_defs].items()}
+    return out
 
 
 class OpenAILLMProvider:
@@ -171,12 +203,19 @@ class OpenAILLMProvider:
         """
         t0 = time.perf_counter()
         if response_schema is not None:
+            # Anthropic's OpenAI-compatible endpoint REQUIRES json_schema.strict=true
+            # (it 400s on strict=false) and enforces a strict-compliant schema, so for
+            # that path we set strict and transform the schema. OpenAI / Gemini keep
+            # the looser strict=false + raw schema — their working behaviour, with the
+            # client-side Pydantic parse as the real guardrail. Verified live against
+            # api.anthropic.com on the real ExtractedGraph schema (BP-7).
+            is_anthropic = self._provider_name == ProviderName.ANTHROPIC
             response_format: dict = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response",
-                    "schema": response_schema,
-                    "strict": False,
+                    "schema": _to_strict_schema(response_schema) if is_anthropic else response_schema,
+                    "strict": is_anthropic,
                 },
             }
         else:
