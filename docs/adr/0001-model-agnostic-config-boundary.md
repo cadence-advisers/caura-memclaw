@@ -142,6 +142,39 @@ and `scripts/reindex_embeddings.py` for the runbook. The CI guard keeps model
 identifiers out of business logic but cannot enforce the `VECTOR_DIM`/column
 agreement — that is the operator's responsibility during a reindex.
 
+## CI enforcement
+
+The guard is only a real guarantee if it runs on every change. It is wired as a
+**required check** in its own GitHub Actions workflow,
+[`.github/workflows/config-boundary-guard.yml`](../../.github/workflows/config-boundary-guard.yml),
+which runs on every pull request and on every push to `main`.
+
+- **What runs:** `pytest tests/test_model_agnostic_config_boundary.py
+  --noconftest` — the four tests in this file. They prove both that runtime
+  source is clean *and* that the guard catches an injected hardcoded-model
+  literal (`test_guard_catches_injected_violations`). Injecting a model id /
+  base URL / provider-selection literal outside the allowlist turns the check
+  red.
+- **Why a dedicated workflow (not `ci.yml`):** the guard is pure AST/file
+  scanning — stdlib + `pytest`, no database, no network. `--noconftest` skips
+  `tests/conftest.py`, whose session-scoped autouse fixtures open a PostgreSQL
+  connection for the integration suite. Keeping the guard separate makes it a
+  fast (~seconds) check that gates merges without flaking on infrastructure, so
+  it is safe to mark **required** in branch protection. The check name is
+  `config-boundary-guard`.
+- **What is explicitly NOT covered here (no silent gaps):** the fuller suite —
+  DB-backed integration tests (`pytest -m integration`), ruff lint/format, mypy,
+  alembic migrations, and package builds — runs in
+  [`ci.yml`](../../.github/workflows/ci.yml), which provisions a
+  `pgvector/pgvector` service. That workflow is the place to add more
+  service-dependent coverage; this one stays infra-free on purpose.
+
+To make the gate binding, add `config-boundary-guard` to the required status
+checks for `main` in the repository's branch-protection settings. (On a freshly
+forked repo GitHub does not register inherited workflows until Actions is
+enabled and a triggering event occurs — enable Actions, and the first PR that
+adds a workflow registers it.)
+
 ## Consequences
 
 - **Positive:** changing the model/provider for any job is a config/env change,
