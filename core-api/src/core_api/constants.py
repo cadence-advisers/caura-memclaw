@@ -1,7 +1,6 @@
 """Centralised constants for the MemClaw API."""
 
 import importlib.metadata
-import os
 
 # Re-export DB-query constants from common (shared with core-storage-api).
 from common.constants import (  # noqa: F401
@@ -20,6 +19,11 @@ from common.constants import (  # noqa: F401
     TYPE_DECAY_DAYS,
     VECTOR_DIM,
 )
+
+# Embedding model default lives in common.embedding.constants (the config
+# boundary). Re-export for back-compat callers importing it from here so the
+# default isn't duplicated as a literal outside the boundary.
+from common.embedding.constants import OPENAI_EMBEDDING_MODEL  # noqa: F401
 
 # Re-export memory-vocabulary constants from common.enrichment (CAURA-595).
 # common is the source of truth so core-api and core-worker stay in sync.
@@ -64,7 +68,6 @@ try:
     VERSION = importlib.metadata.version("core-api")
 except importlib.metadata.PackageNotFoundError:
     VERSION = "dev"
-OPENAI_EMBEDDING_MODEL = os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
 EMBEDDING_RETRY_ATTEMPTS = 2
 EMBEDDING_RETRY_DELAY_S = 1.0
 EMBEDDING_REEMBED_DELAY_S = 30.0

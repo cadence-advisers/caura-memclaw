@@ -21,7 +21,9 @@ Cross-worker invalidation is tracked as a follow-up (see CAURA-571).
 
 from __future__ import annotations
 
+import json
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any
 
@@ -270,48 +272,83 @@ DEFAULT_SETTINGS: dict = {
     "api_keys": {},
 }
 
-# Keys are ``ProviderName`` enum values (.value) so a typo here is caught
-# at import time rather than silently producing an entry UI that no tenant
-# can select.
-PROVIDER_OPTIONS = {
-    "enrichment": {
-        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
-        ProviderName.GEMINI.value: [
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ],
-    },
-    "recall": {
-        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
-        ProviderName.GEMINI.value: [
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ],
-    },
-    "embedding": {
-        ProviderName.OPENAI.value: ["text-embedding-3-small", "text-embedding-3-large"],
-    },
-    "entity_extraction": {
-        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
-        ProviderName.GEMINI.value: [
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ],
-    },
-    "fallback_llm": {
-        ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
-        ProviderName.GEMINI.value: [
-            "gemini-3.1-flash-lite-preview",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ],
-        ProviderName.ANTHROPIC.value: ["claude-haiku-4-5-20251001"],
-        ProviderName.OPENROUTER.value: ["openai/gpt-5.4-nano", "openai/gpt-4.1-nano"],
-    },
+# ── Suggested models (informational only) ──
+#
+# This is the SUGGESTION list surfaced to the settings UI at
+# ``GET /settings/providers`` — a convenience so the dropdown shows
+# known-good models per task. It is **NOT** a validation allowlist.
+# Tenant ``provider``/``model`` values are accepted pass-through by
+# ``update_settings`` (the leaf-type validator pins them to ``str`` and
+# nothing else); the LLM/embedding registries degrade gracefully on an
+# unknown provider/model. So a tenant can select ANY provider in
+# ``ProviderName`` and ANY model string via config/env with no code edit
+# here — see ``docs/adr/0001-model-agnostic-config-boundary.md``.
+#
+# To add a model without a code change, set ``MEMCLAW_SUGGESTED_MODELS_JSON``
+# (a JSON object of ``{task: {provider: [models...]}}``) in the environment;
+# it is merged over these defaults at import time.
+#
+# Keys are ``ProviderName`` enum values (.value) so a typo in the defaults
+# is caught at import time. The env override is intentionally NOT enum-pinned
+# — any provider string is allowed there, mirroring the pass-through runtime.
+
+# Shared per-task model suggestions. Anthropic + OpenRouter are first-class
+# selectable providers for every LLM task (the registry routes all three
+# through the OpenAI-compatible path); they are not validation-gated.
+_LLM_SUGGESTIONS = {
+    ProviderName.OPENAI.value: ["gpt-5.4-nano", "gpt-5.4-mini", "gpt-4.1-nano", "gpt-4o-mini"],
+    ProviderName.GEMINI.value: [
+        "gemini-3.1-flash-lite-preview",
+        "gemini-2.5-flash-lite",
+        "gemini-2.0-flash",
+    ],
+    ProviderName.ANTHROPIC.value: ["claude-haiku-4-5-20251001"],
+    ProviderName.OPENROUTER.value: ["openai/gpt-5.4-nano", "openai/gpt-4.1-nano"],
 }
+
+
+def _default_provider_options() -> dict[str, dict[str, list[str]]]:
+    return {
+        "enrichment": dict(_LLM_SUGGESTIONS),
+        "recall": dict(_LLM_SUGGESTIONS),
+        "embedding": {
+            ProviderName.OPENAI.value: ["text-embedding-3-small", "text-embedding-3-large"],
+            # ``local`` is the deployed default embedder (BAAI/bge-m3, 1024-dim;
+            # see alembic 012). Surfaced so the UI stops implying OpenAI is the
+            # only embedding option.
+            ProviderName.LOCAL.value: ["BAAI/bge-m3"],
+        },
+        "entity_extraction": dict(_LLM_SUGGESTIONS),
+        "fallback_llm": dict(_LLM_SUGGESTIONS),
+    }
+
+
+def _load_provider_options() -> dict[str, dict[str, list[str]]]:
+    """Build the suggestion list, merging an optional env override.
+
+    ``MEMCLAW_SUGGESTED_MODELS_JSON`` lets an operator extend or override the
+    suggestions per task/provider without a code change. Malformed JSON is
+    ignored (logged) rather than crashing import — suggestions are cosmetic.
+    """
+    base = _default_provider_options()
+    raw = os.environ.get("MEMCLAW_SUGGESTED_MODELS_JSON")
+    if not raw:
+        return base
+    try:
+        override = json.loads(raw)
+    except (ValueError, TypeError):
+        logger.warning("MEMCLAW_SUGGESTED_MODELS_JSON is not valid JSON; ignoring")
+        return base
+    if not isinstance(override, dict):
+        logger.warning("MEMCLAW_SUGGESTED_MODELS_JSON must be a JSON object; ignoring")
+        return base
+    for task, providers in override.items():
+        if isinstance(providers, dict):
+            base.setdefault(task, {}).update(providers)
+    return base
+
+
+PROVIDER_OPTIONS = _load_provider_options()
 
 
 def _remap_vertex(provider: str) -> str:

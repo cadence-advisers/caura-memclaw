@@ -1,10 +1,26 @@
 """DB-query constants shared between core-api and core-storage-api."""
 
+import os
+
 # ── Embeddings ──
-# Native dim of the default embedder (BAAI/bge-m3, see local-embedder docs).
-# Schema upgrade lives in alembic migration 012_vector_dim_1024.py — keep
-# this constant in lock-step with that migration.
-VECTOR_DIM = 1024
+# Embedding vector dimension. Defaults to 1024 — the native dim of the default
+# embedder (BAAI/bge-m3, see local-embedder docs). Env-overridable
+# (``VECTOR_DIM``) so the dimension is a CONFIG value, not a code constant.
+#
+# IMPORTANT — this must stay in lock-step with the pgvector column type in the
+# database (``vector(N)``, pinned by alembic migration 012_vector_dim_1024.py).
+#   • Same-dimension model swaps (e.g. one 1024-dim embedder for another) are a
+#     PURE CONFIG change — set the provider/model env vars; VECTOR_DIM and the
+#     schema are untouched.
+#   • Cross-dimension swaps require a REINDEX: change ``VECTOR_DIM`` AND ship a
+#     migration that ALTERs the column type, then re-embed every row (the old
+#     vectors are not coercible to the new width). See
+#     ``docs/embedding-dimension-and-reindex.md`` and
+#     ``scripts/reindex_embeddings.py``.
+# Reading from env at import time keeps a single source of truth across
+# core-api (tenant-aware) and core-worker / core-storage-api (platform-only),
+# all of which import this module.
+VECTOR_DIM = int(os.environ.get("VECTOR_DIM") or 1024)
 
 # ── Write-time semantic dedup ──
 SEMANTIC_DEDUP_THRESHOLD = 0.95  # cosine similarity above this -> near-duplicate
