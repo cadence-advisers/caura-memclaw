@@ -69,7 +69,9 @@ def _to_strict_schema(schema: dict) -> dict:
     if out.get("type") == "object" or "properties" in out:
         out["additionalProperties"] = False
         if "properties" in out:
-            out["properties"] = {k: _to_strict_schema(v) for k, v in out["properties"].items()}
+            out["properties"] = {
+                k: _to_strict_schema(v) for k, v in out["properties"].items()
+            }
             out["required"] = list(out["properties"].keys())
     if "items" in out:
         out["items"] = _to_strict_schema(out["items"])
@@ -80,6 +82,40 @@ def _to_strict_schema(schema: dict) -> dict:
         if _defs in out:
             out[_defs] = {k: _to_strict_schema(v) for k, v in out[_defs].items()}
     return out
+
+
+def _loads_json_lenient(content: str) -> object:
+    """Parse JSON from an LLM reply, tolerating markdown fences / prose.
+
+    The ``response_format`` modes (json_object / json_schema) guarantee bare
+    JSON, but the schemaless Anthropic path (BP-10) omits ``response_format``
+    and leans on the prompt, so the model may wrap its JSON in ``` fences or
+    prepend a sentence. Try a direct parse first (the fast, common case), then
+    strip a fenced block, then fall back to the outermost ``{...}`` / ``[...]``
+    span. Raises ``json.JSONDecodeError`` if nothing parses — the same failure
+    type the caller already handles.
+    """
+    s = content.strip()
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        pass
+    if s.startswith("```"):
+        s2 = s[3:]
+        if s2[:4].lower() == "json":
+            s2 = s2[4:]
+        s2 = s2.strip()
+        if s2.endswith("```"):
+            s2 = s2[:-3].strip()
+        try:
+            return json.loads(s2)
+        except json.JSONDecodeError:
+            s = s2
+    for open_ch, close_ch in (("{", "}"), ("[", "]")):
+        start, end = s.find(open_ch), s.rfind(close_ch)
+        if start != -1 and end > start:
+            return json.loads(s[start : end + 1])
+    return json.loads(s)  # nothing matched — raise a clean JSONDecodeError
 
 
 class OpenAILLMProvider:
@@ -202,6 +238,8 @@ class OpenAILLMProvider:
         ``None`` preserves today's shape-less behaviour.
         """
         t0 = time.perf_counter()
+        is_anthropic = self._provider_name == ProviderName.ANTHROPIC
+        response_format: dict | None
         if response_schema is not None:
             # Anthropic's OpenAI-compatible endpoint REQUIRES json_schema.strict=true
             # (it 400s on strict=false) and enforces a strict-compliant schema, so for
@@ -209,23 +247,34 @@ class OpenAILLMProvider:
             # the looser strict=false + raw schema — their working behaviour, with the
             # client-side Pydantic parse as the real guardrail. Verified live against
             # api.anthropic.com on the real ExtractedGraph schema (BP-7).
-            is_anthropic = self._provider_name == ProviderName.ANTHROPIC
-            response_format: dict = {
+            response_format = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "response",
-                    "schema": _to_strict_schema(response_schema) if is_anthropic else response_schema,
+                    "schema": _to_strict_schema(response_schema)
+                    if is_anthropic
+                    else response_schema,
                     "strict": is_anthropic,
                 },
             }
+        elif is_anthropic:
+            # No caller schema: Anthropic's compat endpoint ALSO rejects
+            # response_format={"type": "json_object"} (400: "response_format.type:
+            # Input should be 'json_schema'"), and with no schema we can't synthesize a
+            # strict json_schema. Omit response_format entirely and lean on the prompt's
+            # JSON instruction + the tolerant parse below. OpenAI / Gemini keep
+            # json_object — their working behaviour. (BP-10: unblocks Claude enrichment
+            # + contradiction detection, which call complete_json with no schema.)
+            response_format = None
         else:
             response_format = {"type": "json_object"}
         create_kwargs: dict = {
             "model": self._model,
             "messages": [{"role": "user", "content": prompt}],
-            "response_format": response_format,
             "temperature": temperature,
         }
+        if response_format is not None:
+            create_kwargs["response_format"] = response_format
         if seed is not None:
             create_kwargs["seed"] = seed
         response = await self._client.chat.completions.create(**create_kwargs)
@@ -238,7 +287,7 @@ class OpenAILLMProvider:
         content = response.choices[0].message.content
         if not content:
             raise ValueError(f"OpenAI returned empty content for model {self._model}")
-        parsed = json.loads(content)
+        parsed = _loads_json_lenient(content)
         if not isinstance(parsed, dict):
             raise OpenAIResponseShapeError(content, type(parsed).__name__)
         return parsed
